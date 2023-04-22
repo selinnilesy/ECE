@@ -1,0 +1,128 @@
+Test batch size: 10000
+Loading fashion-mnist data...Done
+Loading model...Done
+Conv-GPU==
+Layer Time: 640.617 ms
+Op Time: 22.6537 ms
+Conv-GPU==
+Layer Time: 525.198 ms
+Op Time: 85.6798 ms
+
+Test Accuracy: 0.8714
+
+        Generating the /build/report1.qdstrm file.
+        Capturing raw events...
+
+        **** WARNING: The collection generated 654361 total events. ****
+        Importing this QDSTRM file into the NVIDIA Nsight Systems GUI may take several minutes to complete.
+
+        Capturing symbol files...
+        Saving diagnostics...
+        Saving qdstrm file to disk...
+        Finished saving file.
+
+
+Importing the qdstrm file using /opt/nvidia/nsight-systems/2019.5.2/host-linux-x64/QdstrmImporter.
+
+Importing...
+
+Importing [==================================================100%]
+Saving report to file "/build/report1.qdrep"
+Report file saved.
+Please discard the qdstrm file and use the qdrep file instead.
+
+Removed /build/report1.qdstrm as it was successfully imported.
+Please use the qdrep file instead.
+
+Exporting the qdrep file to SQLite database using /opt/nvidia/nsight-systems/2019.5.2/host-linux-x64/nsys-exporter.
+
+Exporting 654258 events:
+
+0%   10   20   30   40   50   60   70   80   90   100%
+|----|----|----|----|----|----|----|----|----|----|
+***************************************************
+
+Exported successfully to
+/build/report1.sqlite
+
+Generating CUDA API Statistics...
+CUDA API Statistics (nanoseconds)
+
+Time(%)      Total Time       Calls         Average         Minimum         Maximum  Name                                                                            
+-------  --------------  ----------  --------------  --------------  --------------  --------------------------------------------------------------------------------
+   74.9      1049704029           8     131213003.6           17319       566593555  cudaMemcpy                                                                      
+   16.6       231809636           8      28976204.5           78615       221395900  cudaMalloc                                                                      
+    7.7       108286646           6      18047774.3            2612        85648895  cudaDeviceSynchronize                                                           
+    0.6         8138579           6       1356429.8           23321         7990123  cudaLaunchKernel                                                                
+    0.2         2684509           8        335563.6           62766          975928  cudaFree                                                                        
+
+
+
+
+Generating CUDA Kernel Statistics...
+
+Generating CUDA Memory Operation Statistics...
+CUDA Kernel Statistics (nanoseconds)
+
+Time(%)      Total Time   Instances         Average         Minimum         Maximum  Name                                                                            
+-------  --------------  ----------  --------------  --------------  --------------  --------------------------------------------------------------------------------
+  100.0       108260495           2      54130247.5        22618465        85642030  conv_forward_kernel                                                             
+    0.0            2720           2          1360.0            1344            1376  prefn_marker_kernel                                                             
+    0.0            2624           2          1312.0            1248            1376  do_not_remove_this_kernel                                                       
+
+
+CUDA Memory Operation Statistics (nanoseconds)
+
+Time(%)      Total Time  Operations         Average         Minimum         Maximum  Name                                                                            
+-------  --------------  ----------  --------------  --------------  --------------  --------------------------------------------------------------------------------
+   92.6       966169252           2     483084626.0       400435278       565733974  [CUDA memcpy DtoH]                                                              
+    7.4        77622770           6      12937128.3            1216        41624993  [CUDA memcpy HtoD]                                                              
+
+
+CUDA Memory Operation Statistics (KiB)
+
+            Total      Operations            Average            Minimum            Maximum  Name                                                                            
+-----------------  --------------  -----------------  -----------------  -----------------  --------------------------------------------------------------------------------
+        1722500.0               2           861250.0         722500.000          1000000.0  [CUDA memcpy DtoH]                                                              
+         538919.0               6            89819.0              0.004           288906.0  [CUDA memcpy HtoD]                                                              
+
+
+
+
+Generating Operating System Runtime API Statistics...
+Operating System Runtime API Statistics (nanoseconds)
+
+Time(%)      Total Time       Calls         Average         Minimum         Maximum  Name                                                                            
+-------  --------------  ----------  --------------  --------------  --------------  --------------------------------------------------------------------------------
+   33.3     94559716056         959      98602415.1           16686       100305556  sem_timedwait                                                                   
+   33.3     94473903527         958      98615765.7           30562       100287589  poll                                                                            
+   22.0     62503574341           2   31251787170.5     22658362379     39845211962  pthread_cond_wait                                                               
+   11.3     32005637989          64     500088093.6       500025132       500174048  pthread_cond_timedwait                                                          
+    0.0       134879770         912        147894.5            1080        22022717  ioctl                                                                           
+    0.0        20222055        9062          2231.5            1128           18844  read                                                                            
+    0.0        16657061          26        640656.2            1055        16583267  fopen                                                                           
+    0.0         3333799          98         34018.4            1147         1337686  mmap                                                                            
+    0.0         1257673         101         12452.2            4875           95567  open64                                                                          
+    0.0          288096           5         57619.2           44190           68538  pthread_create                                                                  
+    0.0          177725           3         59241.7           51317           66590  fgets                                                                           
+    0.0          100670          17          5921.8            1626           13526  munmap                                                                          
+    0.0           78419           3         26139.7            3148           54628  fopen64                                                                         
+    0.0           59790          15          3986.0            1357            6541  write                                                                           
+    0.0           54518           9          6057.6            1107            9756  fflush                                                                          
+    0.0           31740           5          6348.0            4012            9053  open                                                                            
+    0.0           26570          14          1897.9            1005            8703  fclose                                                                          
+    0.0           13832           2          6916.0            6011            7821  socket                                                                          
+    0.0           10036           2          5018.0            4820            5216  pthread_cond_signal                                                             
+    0.0            8723           4          2180.7            1036            5358  fwrite                                                                          
+    0.0            8133           1          8133.0            8133            8133  pipe2                                                                           
+    0.0            7979           6          1329.8            1113            1786  fcntl                                                                           
+    0.0            7662           1          7662.0            7662            7662  connect                                                                         
+    0.0            2193           1          2193.0            2193            2193  bind                                                                            
+    0.0            1197           1          1197.0            1197            1197  listen                                                                          
+
+
+
+
+Generating NVTX Push-Pop Range Statistics...
+NVTX Push-Pop Range Statistics (nanoseconds)
+✱ The build folder has been uploaded to http://s3.amazonaws.com/files.rai-project.com/userdata/build-6444551aa32cb2472239cf67.tar.gz. The data will be present for only a short duration of time.
