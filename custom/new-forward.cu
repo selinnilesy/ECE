@@ -54,13 +54,15 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
     int h = (blockIdx.y / W_grid) * TILE_WIDTH + threadIdx.y;
     int w = (blockIdx.y % W_grid) * TILE_WIDTH + threadIdx.x;
     float acc = 0.0f;
-    for(int c=0; c<Channel;c++){
-        for (int p = 0; p < K; p++){
-            for (int q = 0; q < K; q++)
-            acc += in_4d(c, h + p, w + q) * mask_4d(m, c, p, q);
+    if (h < Height_out && w < Width_out){
+        for(int c=0; c<Channel;c++){
+            for (int p = 0; p < K; p++){
+                for (int q = 0; q < K; q++)
+                acc += in_4d(c, h + p, w + q) * mask_4d(m, c, p, q);
+            }
         }
+        out_4d( m, h, w) = acc;
     }
-    if (h < Height_out && w < Width_out) out_4d( m, h, w) = acc;
 
 
     #undef out_4d
@@ -86,13 +88,17 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     int outputSize = Map_out * Height_out * Width_out;
 
     float *device_output_ptr2= NULL;
+    float *device_output_ptr3= NULL;
     float *device_input_ptr2 = NULL;
+    float *device_input_ptr3 = NULL;
 
     errCheck(cudaMalloc((void **) device_input_ptr, inputSize * sizeof(float)));
     errCheck(cudaMalloc((void **) &device_input_ptr2, inputSize * sizeof(float)));
+    errCheck(cudaMalloc((void **) &device_input_ptr3, inputSize * sizeof(float)));
 
     errCheck(cudaMalloc((void **) device_output_ptr, outputSize * sizeof(float)));
     errCheck(cudaMalloc((void **) &device_output_ptr2, outputSize * sizeof(float)));
+    errCheck(cudaMalloc((void **) &device_output_ptr3, outputSize * sizeof(float)));
 
     errCheck(cudaMemcpyToSymbol(mask, host_mask, maskSize*sizeof(float)));
 
@@ -121,27 +127,39 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     std::cout << host_input_pinned[2*inputSize] << '\t';
      */
 
-    cudaStream_t  stream0, stream1;
+    cudaStream_t  stream0, stream1, stream2;
     cudaStreamCreate(&stream0);
     cudaStreamCreate(&stream1);
+    cudaStreamCreate(&stream2);
 
-    for (int i=0; i<Batch/2; i+=2) {
-        //cudaMemCpyAsync(*device_input_ptr, &host_input[i*SegSizeInput], SegSizeInput*sizeof(float), cudaMemcpyHostToDevice, stream0);
-        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[i*inputSize],
-                  inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
-        errCheck(cudaMemcpyAsync((device_input_ptr2), &host_input[(i+1)*inputSize],
-                  inputSize*sizeof(float), cudaMemcpyHostToDevice, stream1));
+    for (int i=0; i<Batch-2; i+=3) {
+        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[i*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
+        errCheck(cudaMemcpyAsync((device_input_ptr2), &host_input[(i+1)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream1));
+        errCheck(cudaMemcpyAsync((device_input_ptr3), &host_input[(i+2)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream2));
+
 
         conv_forward_kernel<<<gridDim, blockDim,0, stream0>>>(*device_output_ptr,*device_input_ptr, NULL, Batch, Map_out, Channel, Height,Width, K );
 
         conv_forward_kernel<<<gridDim, blockDim,0, stream1>>>(device_output_ptr2,device_input_ptr2, NULL, Batch, Map_out, Channel, Height,Width, K );
 
+        conv_forward_kernel<<<gridDim, blockDim,0, stream2>>>(device_output_ptr3,device_input_ptr3, NULL, Batch, Map_out, Channel, Height,Width, K );
+
         errCheck(cudaMemcpyAsync((void *) &host_output[i*outputSize], *device_output_ptr, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
         errCheck(cudaMemcpyAsync((void *) &host_output[(i+1)*outputSize], (device_output_ptr2), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream1));
+        errCheck(cudaMemcpyAsync((void *) &host_output[(i+2)*outputSize], (device_output_ptr3), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream2));
+
     }
+
+    errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[(Batch-1)*inputSize],
+                  inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
+    conv_forward_kernel<<<gridDim, blockDim,0, stream0>>>(*device_output_ptr,*device_input_ptr, NULL, Batch, Map_out, Channel, Height,Width, K );
+    errCheck(cudaMemcpyAsync((void *) &host_output[(Batch-1)*outputSize], *device_output_ptr, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
+    cudaStreamSynchronize(stream0);
+
 
     cudaStreamDestroy(stream0);
     cudaStreamDestroy(stream1);
+    cudaStreamDestroy(stream2);
 
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();

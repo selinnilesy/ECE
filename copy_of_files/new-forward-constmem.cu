@@ -114,6 +114,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
     const int Width_out = Width - K + 1;
     const int W_grid=ceil((1.0* Width_out)/TILE_WIDTH);
     const int H_grid=ceil((1.0* Height_out)/TILE_WIDTH);
+    //std::cout<<"W_grid: "<<W_grid<<std::endl;
+    //std::cout<<"H_grid: "<<H_grid<<std::endl;
 
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
     dim3 gridDim(Map_out, W_grid*H_grid, Batch);
