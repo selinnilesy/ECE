@@ -55,11 +55,12 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
                     Pvalue  += mask_4d(m, c, j,k) * tile[j+ty][k+tx];
                 }
             }
-            if((oY < Height_out) && (oX < Width_out))
-                out_4d(imgId, m, oY, oX) = Pvalue;
         }
-         __syncthreads (); // wait for tile
+        __syncthreads (); // wait for tile
     }
+    if(ty < TILE_WIDTH && tx <TILE_WIDTH & oY < Height_out && (oX < Width_out))
+            out_4d(imgId, m, oY, oX) = Pvalue;
+
     #undef out_4d
     #undef in_4d
     #undef mask_4d
