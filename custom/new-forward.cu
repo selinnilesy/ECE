@@ -11,65 +11,59 @@ inline void checkError(cudaError_t err, const char * file, int line, bool abort 
 }
 
 __constant__ float mask[3136];
-#define TILE_WIDTH 32
+#define TILE_WIDTH 8
+
 __global__ void conv_forward_kernel(float *output, const float *input, const float *none,
      const int Batch, const int Map_out, const int Channel,
      const int Height, const int Width, const int K)
 {
-    /*
-    Function paramter definitions:
-    output - output
-    input - input
-    mask - convolution kernel
-    Batch - batch_size (number of images in x)
-    Map_out - number of output feature maps
-    Channel - number of input feature maps
-    Height - input height dimension
-    Width - input width dimension
-    K - kernel height and width (K x K)
-    */
+    __shared__ float tile[TILE_WIDTH+6][TILE_WIDTH+6];
 
     const int Height_out = Height - K + 1;
     const int Width_out = Width - K + 1;
-    //(void)Height_out; // silence declared but never referenced warning. remove this line when you start working
-    //(void)Width_out; // silence declared but never referenced warning. remove this line when you start working
 
-    // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
-    // An example use of these macros:
-    // float a = in_4d(0,0,0,0)
-    // out_4d(0,0,0,0) = a
+    int imgId = blockIdx.z;
+    int m = blockIdx.x;
+    const int W_grid=ceil((1.0*Width_out)/TILE_WIDTH);
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int by = (blockIdx.y / W_grid);
+    int bx = (blockIdx.y % W_grid);
+
+    int oX = bx * TILE_WIDTH + tx;
+    int oY = by * TILE_WIDTH + ty;
+
+    int iX = oX-3; // MASK_WIDTH
+    int iY = oY-3; // radius=3
 
     #define out_4d(i3, i2, i1, i0) output[(i3) * (Map_out * Height_out * Width_out) + (i2) * (Height_out * Width_out) + (i1) * (Width_out) + i0]
     #define in_4d(i3, i2, i1, i0) input[(i3) * (Channel * Height * Width) + (i2) * (Height * Width) + (i1) * (Width) + i0]
     #define mask_4d(i3, i2, i1, i0) mask[(i3) * (Channel * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
-    // Insert your GPU convolution kernel code here
-    //__shared__ float tile_input[TILE_WIDTH][TILE_WIDTH];
-    //__shared__ float tile_mask[7][7];
+    float Pvalue = 0.0f;
+    for(int c=0; c<Channel;c++){
+        if((iX >= -3) && (iX < Width_out+3) && (iY >= -3)  && (iY < Height_out+3) )
+        tile[ty][tx] = in_4d(imgId, c, iY+3,iX+3);
 
-    int imgId = blockIdx.z;
-    int m = blockIdx.x;
-    const int W_grid=ceil((1.0*Width_out)/TILE_WIDTH);
-    //const int H_grid=Height_out/TILE_WIDTH;
-    int h = (blockIdx.y / W_grid) * TILE_WIDTH + threadIdx.y;
-    int w = (blockIdx.y % W_grid) * TILE_WIDTH + threadIdx.x;
-    float acc = 0.0f;
-    if (h < Height_out && w < Width_out){
-        for(int c=0; c<Channel;c++){
-            for (int p = 0; p < K; p++){
-                for (int q = 0; q < K; q++)
-                acc += in_4d(imgId, c, h + p, w + q) * mask_4d(m, c, p, q);
+        __syncthreads (); // wait for tile
+
+        if(ty < TILE_WIDTH && tx <TILE_WIDTH){
+            for(int j = 0; j < K; j++) {
+                for(int k = 0; k < K; k++) {
+                    Pvalue  += mask_4d(m, c, j,k) * tile[j+ty][k+tx];
+                }
             }
+            if((oY < Height_out) && (oX < Width_out))
+                out_4d(imgId, m, oY, oX) = Pvalue;
         }
-        out_4d(imgId , m, h, w) = acc;
+         __syncthreads (); // wait for tile
     }
-
-
     #undef out_4d
     #undef in_4d
     #undef mask_4d
 }
-
 
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, const float *host_input, const float *host_mask, float **device_output_ptr, float **device_input_ptr, float **device_mask_ptr, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
@@ -80,80 +74,46 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 
     const int Height_out = Height - K + 1;
     const int Width_out = Width - K + 1;
-    const int W_grid=ceil((1.0* Width_out)/TILE_WIDTH);
-    const int H_grid=ceil((1.0* Height_out)/TILE_WIDTH);
 
-    int inputSize = 8 * Channel * Height * Width;
+    int inputSize = Batch * Channel * Height * Width;
     int maskSize = Map_out * Channel * K * K;
-    int outputSize = 8 * Map_out * Height_out * Width_out;
+     int outputSize = Batch * Map_out * Height_out * Width_out;
 
-    float *device_output_ptr2= NULL;
-    float *device_input_ptr2 = NULL;
 
     errCheck(cudaMalloc((void **) device_input_ptr, inputSize * sizeof(float)));
-    errCheck(cudaMalloc((void **) &device_input_ptr2, inputSize * sizeof(float)));
-
     errCheck(cudaMalloc((void **) device_output_ptr, outputSize * sizeof(float)));
-    errCheck(cudaMalloc((void **) &device_output_ptr2, outputSize * sizeof(float)));
 
+    errCheck(cudaMemcpy(*device_input_ptr, host_input, inputSize * sizeof(float), cudaMemcpyHostToDevice));
     errCheck(cudaMemcpyToSymbol(mask, host_mask, maskSize*sizeof(float)));
 
 
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(Map_out, W_grid*H_grid, 8);
+    // Useful snippet for error checking
+    cudaError_t error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+         std::cout<<"CUDA all error: "<<cudaGetErrorString(error)<<std::endl;
+         exit(-1);
+     }
 
-    /*
-     *
-     * HERE I HAVE AN UNUSED CODE BECAUSE I ASSUME HOST INPUT AND OUTPUT ALREADY ALLOCATED WITH CUDA MALLOCHOST FUNCTION.
-     *
-    float *host_output_pinned= NULL;
-    float *host_output_pinned2 = NULL;
-    float *host_input_pinned= NULL;
+}
 
-    errCheck(cudaMallocHost ( (void**) &host_output_pinned, outputSize*sizeof(float) ));
-    errCheck(cudaMallocHost ( (void**) &host_output_pinned2, outputSize *sizeof(float)));
-    errCheck(cudaMallocHost ( (void**) &host_input_pinned, Batch*inputSize*sizeof(float) ));
-     std::cout << "host_input_pinned: ";
-    for(int i=0; i<Batch*inputSize; i++){
-        host_input_pinned[i] = host_input[i];
-    }
 
-    std::cout << host_input_pinned[0] << '\t';
-    std::cout << host_input_pinned[1*inputSize] << '\t';
-    std::cout << host_input_pinned[2*inputSize] << '\t';
-     */
+__host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *device_input, const float *device_mask,
+      const int Batch, const int Map_out, const int Channel, const int Height,
+      const int Width, const int K)
+{
+    // Set the kernel dimensions and call the kernel
 
-    cudaStream_t  stream0, stream1;
-    cudaStreamCreate(&stream0);
-    cudaStreamCreate(&stream1);
-    int ctr=0;
-    for (int i=0; i<Batch/16; i+=1) {
-        ctr=i*2;
-        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[ctr*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
-        errCheck(cudaMemcpyAsync((device_input_ptr2), &host_input[(ctr+1)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream1));
+    const int Height_out = Height - K + 1;
+    const int Width_out = Width - K + 1;
+    const int W_grid=ceil((1.0* Height_out)/TILE_WIDTH);
+    const int H_grid=ceil((1.0* Width_out)/TILE_WIDTH);
+    //std::cout<<"W_grid: "<<W_grid<<std::endl;
+    //std::cout<<"H_grid: "<<H_grid<<std::endl;
 
-        conv_forward_kernel<<<gridDim, blockDim,0, stream0>>>(*device_output_ptr,*device_input_ptr, NULL, Batch, Map_out, Channel, Height,Width, K );
-        conv_forward_kernel<<<gridDim, blockDim,0, stream1>>>(device_output_ptr2,device_input_ptr2, NULL, Batch, Map_out, Channel, Height,Width, K );
-
-        errCheck(cudaMemcpyAsync((void *) &host_output[ctr*outputSize], *device_output_ptr, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
-        errCheck(cudaMemcpyAsync((void *) &host_output[(ctr+1)*outputSize], (device_output_ptr2), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream1));
-
-    }
-
-    if(Batch==100){
-        dim3 gridDim2(Map_out, W_grid*H_grid, 4);
-        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[(Batch/4-1)*(inputSize/2)], (inputSize/2)*sizeof(float), cudaMemcpyHostToDevice, stream0));
-        conv_forward_kernel<<<gridDim2, blockDim,0, stream0>>>(*device_output_ptr,*device_input_ptr, NULL, Batch, Map_out, Channel, Height,Width, K );
-        errCheck(cudaMemcpyAsync((void *) &host_output[(Batch/4-1)*(outputSize/2)], *device_output_ptr, (outputSize/2)*sizeof(float), cudaMemcpyDeviceToHost, stream0));
-    }
-    else if(Batch==1000){
-        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[124*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
-        conv_forward_kernel<<<gridDim, blockDim,0, stream0>>>(*device_output_ptr,*device_input_ptr, NULL, Batch, Map_out, Channel, Height,Width, K );
-        errCheck(cudaMemcpyAsync((void *) &host_output[124*outputSize], *device_output_ptr, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
-    }
-
-    cudaStreamDestroy(stream0);
-    cudaStreamDestroy(stream1);
+    dim3 blockDim(TILE_WIDTH+ K - 1, TILE_WIDTH+ K - 1 , 1);
+    dim3 gridDim(Map_out, W_grid*H_grid, Batch);
+    conv_forward_kernel<<< gridDim, blockDim >>>(device_output,device_input, NULL, Batch, Map_out, Channel, Height,Width, K );
 
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();
@@ -164,39 +124,14 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
      }
 }
 
-__host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *device_input, const float *device_mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K){
-    /*
-     *
-     * const int Height_out = Height - K + 1;
-    const int Width_out = Width - K + 1;
-
-    const int W_grid=ceil((1.0* Width_out)/TILE_WIDTH);
-    const int H_grid=ceil((1.0* Height_out)/TILE_WIDTH);
-
-    const int W_grid=ceil((1.0* Width_out)/TILE_WIDTH);
-    const int H_grid=ceil((1.0* Height_out)/TILE_WIDTH);
-
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(Map_out, W_grid*H_grid, Batch);
-    conv_forward_kernel<<< gridDim, blockDim >>>(device_output,device_input, device_mask, Batch, Map_out, Channel, Height,Width, K );
-    */
-    cudaError_t error = cudaGetLastError();
-    if(error != cudaSuccess)
-    {
-         std::cout<<"CUDA kern error: "<<cudaGetErrorString(error)<<std::endl;
-         exit(-1);
-     }
-
-}
-
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *device_output, float *device_input, float *device_mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
     // Copy the output back to host'
-    //const int Height_out = Height - K + 1;
-   // const int Width_out = Width - K + 1;
-   // int outputSize = Batch * Map_out * Height_out * Width_out;
-    //errCheck(cudaMemcpy(host_output, device_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
+    const int Height_out = Height - K + 1;
+    const int Width_out = Width - K + 1;
+    int outputSize = Batch * Map_out * Height_out * Width_out;
+    errCheck(cudaMemcpy(host_output, device_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Free device memory
     errCheck(cudaFree(device_output));
@@ -234,3 +169,54 @@ __host__ void GPUInterface::get_device_properties()
         std::cout<<"Warp Size: "<<deviceProp.warpSize<<std::endl;
     }
 }
+
+/*
+ *     // First, create a cuBLAS handle:
+    cudaError_t cudaStat;
+    cublasStatus_t stat;
+    cublasHandle_t handle;
+
+    stat = cublasCreate(&handle);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("CUBLAS initialization failed\n");
+        return EXIT_FAILURE;
+    }
+
+    // Set the math mode to allow cuBLAS to use Tensor Cores:
+    cublasStat = cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+
+     cublasSetMatrix(int rows, int cols, int elemSize, const void *A, int lda, void *B, int ldb);
+    stat = cublasSetMatrix (M, N, sizeof(*a), a, M, devPtrA, M);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("data download failed");
+        cudaFree (devPtrA);
+        cublasDestroy(handle);
+        return EXIT_FAILURE;
+    }
+
+    float alpha==1.0;
+    float beta==0.0;
+    cublasStatus_t cublasSgemm( handle, CUBLAS_OPT_T, CUBLAS_OPT_T,
+                           K, K, K,
+                           &alpha,
+                           const float           *A, &K,
+                           const float           *B, &K,
+                           &beta,
+                           NULL, int ldc)
+
+    stat = cublasGetMatrix (M, N, sizeof(*a), devPtrA, M, a, M);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("data upload failed");
+        cudaFree (devPtrA);
+        cublasDestroy(handle);
+        return EXIT_FAILURE;
+    }
+    cudaFree (devPtrA);
+    cublasDestroy(handle);
+    for (j = 1; j <= N; j++) {
+        for (i = 1; i <= M; i++) {
+            printf ("%7.0f", a[IDX2F(i,j,M)]);
+        }
+        printf ("\n");
+    }
+ */
