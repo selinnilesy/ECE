@@ -11,7 +11,7 @@ inline void checkError(cudaError_t err, const char * file, int line, bool abort 
     }
 }
 
-//__constant__ float mask[3136];
+__constant__ float mask[3136];
 #define TILE_WIDTH 16
 #define MAX_NUM_THREADS 1024
 
@@ -102,7 +102,7 @@ __global__ void conv_forward_kernel(float *X_unroll, const float *X, const float
     #undef mask_4d
 }
 
-__global__ void matrixMultiply(float *A, float *B, float *C, int numARows,
+__global__ void matrixMultiply(float *B, float *C, int numARows,
                                int numAColumns, int numBRows,
                                int numBColumns, int numCRows,
                                int numCColumns)
@@ -130,7 +130,7 @@ __global__ void matrixMultiply(float *A, float *B, float *C, int numARows,
         int col = q* TILE_WIDTH + tx;
         int row = q * TILE_WIDTH + ty;
         if(Row < numCRows) {
-            if(col < numBRows ) subTileM[ty][tx] = A[Row*numAColumns + col];
+            if(col < numBRows ) subTileM[ty][tx] = mask[Row*numAColumns + col];
             else subTileM[ty][tx] = 0.0;
         }
         else{
@@ -172,57 +172,57 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 
     float *device_X_unrolled;
     float *device_X, *device_output;
-    float *device_mask;
-    errCheck(cudaMalloc((void **) &device_mask, maskSize * sizeof(float)));
+    //float *device_mask;
+    //errCheck(cudaMalloc((void **) &device_mask, maskSize * sizeof(float)));
     errCheck(cudaMalloc((void **) &device_X_unrolled, W_unroll * H_unroll * sizeof(float)));
-    errCheck(cudaMalloc((void **) &device_X, Batch*inputSize * sizeof(float)));
     errCheck(cudaMalloc((void **) &device_output, outputSize * sizeof(float)));
-    errCheck(cudaMemcpy(device_mask, host_mask, maskSize * sizeof(float), cudaMemcpyHostToDevice));
 
-    errCheck(cudaMemcpy(device_X, host_input, Batch*inputSize * sizeof(float), cudaMemcpyHostToDevice));
-
-
-    //errCheck(cudaMemcpyToSymbol(mask, host_mask, maskSize*sizeof(float)));
+    // errCheck(cudaMemcpy(device_mask, host_mask, maskSize * sizeof(float), cudaMemcpyHostToDevice));
+    errCheck(cudaMemcpyToSymbol(mask, host_mask, maskSize*sizeof(float)));
 
     int num_threads = C * H_out * W_out;
     int num_blocks = ceil((1.0 * num_threads) / MAX_NUM_THREADS);
-    /*
+    /*   for bad solution
         dim3 dimGrid(Map_out, W_unroll, 1);
         dim3 dimBlock(K*K, 1, 1);
+          for non-tiled solution
+        dim3 dimGrid(W_unroll, Map_out, 1);
+        dim3 dimBlock(1, 1, 1);
+        matrixMultiply<<<dimGrid, dimBlock>>>( device_mask,  device_X_unrolled, device_output , Map_out, H_unroll, H_unroll, W_unroll, Map_out, W_unroll, C,  K,  H_out,  W_out);
     */
+
+    errCheck(cudaMalloc((void **) &device_X, inputSize * sizeof(float)));
+
+    cudaStream_t  stream0, stream1;
+    cudaStreamCreate(&stream0);
+    cudaStreamCreate(&stream1);
+
+    //errCheck(cudaMemcpy(device_X, host_input, Batch*inputSize * sizeof(float), cudaMemcpyHostToDevice));
+
     for (int n=0; n < Batch; n++) {
+        errCheck(cudaMemcpyAsync(device_X, &host_input[n*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
         // unroll kernel actually, therefore will not be using map or batch count
-        conv_forward_kernel<<<num_blocks, MAX_NUM_THREADS>>>(device_X_unrolled, &device_X[n*inputSize], NULL,Batch,Map_out,C,  H,  W,  K);
+        conv_forward_kernel<<<num_blocks, MAX_NUM_THREADS, 0 , stream0>>>(device_X_unrolled, device_X, NULL,Batch,Map_out,C,  H,  W,  K);
 
         dim3 gridDim (ceil(1.0 * W_unroll / TILE_WIDTH),  ceil(1.0 *  Map_out/ TILE_WIDTH), 1);
         dim3 blockDim (TILE_WIDTH, TILE_WIDTH, 1);
         //forward_kernel<<<gridDim, blockDim>>>(device_mask,  device_X_unrolled, device_output, H_unroll, Map_out, W_unroll);
-        matrixMultiply<<<gridDim, blockDim>>>(device_mask, device_X_unrolled, device_output, Map_out,
+        matrixMultiply<<<gridDim, blockDim, 0, stream0>>>( device_X_unrolled, device_output, Map_out,
                                H_unroll, H_unroll,
                                W_unroll, Map_out,
                                W_unroll) ;
-
-        cudaDeviceSynchronize();
-
-        /*
-        dim3 dimGrid(W_unroll, Map_out, 1);
-        dim3 dimBlock(1, 1, 1);
-        matrixMultiply<<<dimGrid, dimBlock>>>( device_mask,  device_X_unrolled, device_output
-                                                  , Map_out, H_unroll,
-                                                  H_unroll, W_unroll,
-                                                  Map_out, W_unroll, C,  K,  H_out,  W_out);
-      */
-
-
-        errCheck(cudaMemcpy((void *) (&host_output[n*outputSize]), device_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
+        errCheck(cudaMemcpyAsync((void *) (&host_output[n*outputSize]), device_output, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
+        //errCheck(cudaMemcpy((void *) (&host_output[n*outputSize]), device_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
     }
+
+    cudaStreamDestroy(stream0);
+    cudaStreamDestroy(stream1);
 
     // Free device memory
     errCheck(cudaFree(device_output));
     errCheck(cudaFree(device_X_unrolled));
     errCheck(cudaFree(device_X));
-    errCheck(cudaFree(device_mask));
+    //errCheck(cudaFree(device_mask));
 
 
     // Useful snippet for error checking
