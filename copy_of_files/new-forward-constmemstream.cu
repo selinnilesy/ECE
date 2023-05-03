@@ -87,26 +87,19 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     int maskSize = Map_out * Channel * K * K;
     int outputSize = (Batch/4) * Map_out * Height_out * Width_out;
 
-    float *device_output_ptr2= NULL;
-    float *device_input_ptr2 = NULL;
+    float *device_output_ptr2, *device_output_ptr3, *device_output_ptr4;
 
-    //float *myhost_out= NULL;
-    //float *myhost_in= NULL;
-
-    //cudaMallocHost ( &myhost_out, 4*outputSize*sizeof(float) ) ;
-    //cudaMallocHost ( &myhost_in, 4*inputSize*sizeof(float) ) ;
-    /*
-     * STILL DOESN'T OVERLAP SO I REMOVED
-     for (int i=0; i<(4*inputSize); i++){
-         myhost_in[i] = host_input[i];
-     }
-     */
+    float *device_input_ptr2, *device_input_ptr3, *device_input_ptr4;
 
     errCheck(cudaMalloc((void **) device_input_ptr, inputSize * sizeof(float)));
     errCheck(cudaMalloc((void **) &device_input_ptr2, inputSize * sizeof(float)));
+    errCheck(cudaMalloc((void **) &device_input_ptr3, inputSize * sizeof(float)));
+    errCheck(cudaMalloc((void **) &device_input_ptr4, inputSize * sizeof(float)));
 
     errCheck(cudaMalloc((void **) device_output_ptr, outputSize * sizeof(float)));
     errCheck(cudaMalloc((void **) &device_output_ptr2, outputSize * sizeof(float)));
+    errCheck(cudaMalloc((void **) &device_output_ptr3, outputSize * sizeof(float)));
+    errCheck(cudaMalloc((void **) &device_output_ptr4, outputSize * sizeof(float)));
 
     errCheck(cudaMemcpyToSymbol(mask, host_mask, maskSize*sizeof(float)));
 
@@ -114,32 +107,50 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
     dim3 gridDim(Map_out, W_grid*H_grid, (Batch/4));
 
-    cudaStream_t  stream0, stream1;
+    cudaStream_t  stream0, stream1, stream2, stream3;
     cudaStreamCreate(&stream0);
     cudaStreamCreate(&stream1);
-    int ctr=0;
-    for (int i=0; i<2; i+=1) {
-        ctr=i*2;
-        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[ctr*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
-        errCheck(cudaMemcpyAsync((device_input_ptr2), &host_input[(ctr+1)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream1));
+    cudaStreamCreate(&stream2);
+    cudaStreamCreate(&stream3);
+    //int ctr=0;
+   // for (int i=0; i<2; i+=1) {
+        //ctr=i*2;
+        errCheck(cudaMemcpyAsync((*device_input_ptr), &host_input[0*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream0));
+        errCheck(cudaMemcpyAsync((device_input_ptr2), &host_input[(1)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream1));
+        errCheck(cudaMemcpyAsync((device_input_ptr3), &host_input[(2)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream2));
+        errCheck(cudaMemcpyAsync((device_input_ptr4), &host_input[(3)*inputSize], inputSize*sizeof(float), cudaMemcpyHostToDevice, stream3));
 
         conv_forward_kernel<<<gridDim, blockDim,0, stream0>>>(*device_output_ptr,*device_input_ptr, NULL, Batch, Map_out, Channel, Height,Width, K );
         conv_forward_kernel<<<gridDim, blockDim,0, stream1>>>(device_output_ptr2,device_input_ptr2, NULL, Batch, Map_out, Channel, Height,Width, K );
+        conv_forward_kernel<<<gridDim, blockDim,0, stream2>>>(device_output_ptr3,device_input_ptr3, NULL, Batch, Map_out, Channel, Height,Width, K );
+        conv_forward_kernel<<<gridDim, blockDim,0, stream3>>>(device_output_ptr4,device_input_ptr4, NULL, Batch, Map_out, Channel, Height,Width, K );
 
-        errCheck(cudaMemcpyAsync((void *) &host_output[ctr*outputSize], *device_output_ptr, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
-        errCheck(cudaMemcpyAsync((void *) &host_output[(ctr+1)*outputSize], (device_output_ptr2), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream1));
-    }
+        errCheck(cudaMemcpyAsync((void *) &host_output[0*outputSize], *device_output_ptr, outputSize*sizeof(float), cudaMemcpyDeviceToHost, stream0));
+        errCheck(cudaMemcpyAsync((void *) &host_output[(1)*outputSize], (device_output_ptr2), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream1));
+        errCheck(cudaMemcpyAsync((void *) &host_output[(2)*outputSize], (device_output_ptr3), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream2));
+        errCheck(cudaMemcpyAsync((void *) &host_output[(3)*outputSize], (device_output_ptr4), outputSize * sizeof(float), cudaMemcpyDeviceToHost, stream3));
+
+
+    // }
 
     cudaStreamDestroy(stream0);
     cudaStreamDestroy(stream1);
+    cudaStreamDestroy(stream2);
+    cudaStreamDestroy(stream3);
 
-    /*  does not work due to const * output
+    /*  does not work due to const* declaration
     for (int i=0; i<(4*outputSize); i++){
          host_output[i] = myhost_out[i];
      }
      */
 
+     errCheck(cudaFree(device_output_ptr4));
+    errCheck(cudaFree(device_output_ptr3));
     errCheck(cudaFree(device_output_ptr2));
+
+
+    errCheck(cudaFree(device_input_ptr4));
+    errCheck(cudaFree(device_input_ptr3));
     errCheck(cudaFree(device_input_ptr2));
 
     // Useful snippet for error checking
@@ -152,21 +163,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *device_input, const float *device_mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K){
-    /*
-     *
-     * const int Height_out = Height - K + 1;
-    const int Width_out = Width - K + 1;
 
-    const int W_grid=ceil((1.0* Width_out)/TILE_WIDTH);
-    const int H_grid=ceil((1.0* Height_out)/TILE_WIDTH);
-
-    const int W_grid=ceil((1.0* Width_out)/TILE_WIDTH);
-    const int H_grid=ceil((1.0* Height_out)/TILE_WIDTH);
-
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(Map_out, W_grid*H_grid, Batch);
-    conv_forward_kernel<<< gridDim, blockDim >>>(device_output,device_input, device_mask, Batch, Map_out, Channel, Height,Width, K );
-    */
     cudaError_t error = cudaGetLastError();
     if(error != cudaSuccess)
     {
@@ -179,16 +176,14 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *device_output, float *device_input, float *device_mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
-    // Copy the output back to host'
-    //const int Height_out = Height - K + 1;
-   // const int Width_out = Width - K + 1;
-   // int outputSize = Batch * Map_out * Height_out * Width_out;
-    //errCheck(cudaMemcpy(host_output, device_output, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Free device memory
+    //errCheck(cudaFree(device_output));
+    //errCheck(cudaFree(device_input));
+    //errCheck(cudaFree(device_mask));
+
     errCheck(cudaFree(device_output));
     errCheck(cudaFree(device_input));
-    //errCheck(cudaFree(device_mask));
 
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();
