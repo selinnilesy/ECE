@@ -9,9 +9,12 @@ using namespace nvcuda;
 const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
-#define MATRIX_M 16
-#define MATRIX_N 912
-#define MATRIX_K 208
+#define MATRIX_M1 16 // 4
+#define MATRIX_N1 640 // = orig, 80*80=640
+#define MATRIX_K1 64 // 1*7*7 = 49
+#define MATRIX_M2 16
+#define MATRIX_N2 912
+#define MATRIX_K2 208 // 4*7*7 = 196
 
 #define errCheck(ans) { checkError((ans), __FILE__, __LINE__); }
 inline void checkError(cudaError_t err, const char * file, int line, bool abort = true) {
@@ -241,19 +244,24 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
      __half *h_host_input, *h_host_mask, *half_device_input_ptr, *half_device_mask;
 
      h_host_input = (__half*) malloc(inputSize*sizeof(__half));
+     h_host_mask = (__half*) malloc(maskSize*sizeof(__half));
      for (int i=0; i<inputSize; i++)
         h_host_input[i] = __float2half(host_input[i]);
 
-     h_host_mask = (__half*) malloc(maskSize*sizeof(__half));
      for (int i=0; i<maskSize; i++)
         h_host_mask[i] = __float2half(host_mask[i]);
 
-    errCheck(cudaMalloc((void **) &half_device_input_ptr, inputSize * sizeof(__half)));
+    errCheck(cudaMalloc((void **) &half_device_input_ptr, MATRIX_K1 * sizeof(__half)));
      errCheck(cudaMalloc((void **) &half_device_mask, maskSize * sizeof(__half)));
     errCheck(cudaMalloc((void **) device_output_ptr, outputSize * sizeof(float)));
 
     errCheck(cudaMemcpy(half_device_input_ptr, h_host_input, inputSize * sizeof(__half), cudaMemcpyHostToDevice));
     errCheck(cudaMemcpy(half_device_mask, h_host_mask, maskSize * sizeof(__half), cudaMemcpyHostToDevice));
+
+    cudaErrCheck(cudaMalloc((void**)&a_fp16, MATRIX_M * MATRIX_K * sizeof(half)));
+   cudaErrCheck(cudaMalloc((void**)&b_fp16, MATRIX_K * MATRIX_N * sizeof(half)));
+
+   cudaErrCheck(cudaMalloc((void**)&c, MATRIX_M * MATRIX_N * sizeof(float)));
 
 
     // First: using WMMA
@@ -272,11 +280,6 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
    cudaEvent_t stopWMMA;
    errCheck(cudaEventCreate(&startWMMA));
    errCheck(cudaEventCreate(&stopWMMA));
-   /*
-   cublasHandle_t cublasHandle;
-   cublasErrCheck(cublasCreate(&cublasHandle));
-   cublasErrCheck(cublasSetMathMode(cublasHandle, CUBLAS_TENSOR_OP_MATH));
-    */
 
    printf("Running with wmma...\n");
    errCheck(cudaEventRecord(startWMMA));
