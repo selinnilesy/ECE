@@ -5,17 +5,6 @@
 #include <mma.h>
 using namespace nvcuda;
 
-// do padding for the dimensions
-const int WMMA_M = 16;
-const int WMMA_N = 16;
-const int WMMA_K = 16;
-#define MATRIX_M1 16 // 4
-#define MATRIX_N1 640 // = orig, 80*80=640
-#define MATRIX_K1 64 // 1*7*7 = 49
-#define MATRIX_M2 16
-#define MATRIX_N2 912
-#define MATRIX_K2 208 // 4*7*7 = 196
-
 #define errCheck(ans) { checkError((ans), __FILE__, __LINE__); }
 inline void checkError(cudaError_t err, const char * file, int line, bool abort = true) {
     if (err != cudaSuccess) {
@@ -25,295 +14,190 @@ inline void checkError(cudaError_t err, const char * file, int line, bool abort 
 }
 
 #define TILE_WIDTH_16 16
-//#define TILE_WIDTH_32 32
-__global__ void conv_forward_kernel_16(float *output, __half *input, __half *mask,
-     const int Batch, const int Map_out, const int Channel,
-     const int Height, const int Width, const int K)
+#define MAX_NUM_THREADS 1024
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+
+
+__global__ void conv_forward_kernel(__half *X_unroll, __half *X, __half *null,
+     const int Batch, const int Map_out, const int C, const int H, const int W, const int K)
 {
-    //__shared__ __half tileA[TILE_WIDTH_16][TILE_WIDTH_16];
-    //__shared__ __half tileB[TILE_WIDTH_16][TILE_WIDTH_16];
+    int c,s,h_out, w_out, p,q, w_unroll, w_base, h_unroll;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int H_out = H - K + 1;
+    int W_out = W - K + 1;
+    int W_unroll = H_out * W_out;
 
-    float alpha = 1.0;
-    float beta=0.0;
+    #define X_unroll( i1, i0) X_unroll[ (i1) * (W_unroll) + (i0)]
+    #define X(i2, i1, i0) X[(i2) * (H * W) + (i1) * (W) + (i0)]
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    wmma::fill_fragment(acc_frag, 0.0f);
-
-    int b = blockIdx.z;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int row = blockIdx.y * TILE_WIDTH_16 + ty;
-    int column = blockIdx.x * TILE_WIDTH_16 + tx;
-
-    int Height_out = Height - K + 1;
-    int Width_out = Width - K + 1;
-
-    int numMatAColumns = Channel*K*K;
-    __half acc=0.0;
-
-    int numIterations = ceil((numMatAColumns*1.0)/TILE_WIDTH_16);
-
-    #define out_4d(i3, i2, i1, i0) &output[(i3) * (Map_out * Height_out * Width_out) + (i2) * (Height_out * Width_out) + (i1) * (Width_out) + i0]
-    #define in_4d(i3, i2, i1, i0) &input[(i3) * (Channel * Height * Width) + (i2) * (Height * Width) + (i1) * (Width) + i0]
-    #define mask_4d(i3, i2, i1, i0) &mask[(i3) * (Channel * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-
-    int lda = Map_out;
-    int ldb = Channel*K*K;
-    int ldc = Map_out;
-
-    for(int i=0; i<numIterations; i++){
-        int tempCol = i*TILE_WIDTH_16+tx;
-        int tempRow = i*TILE_WIDTH_16+ty;
-
-        int W_m = row;
-        int W_c = tempCol/(K*K);
-        int W_h = (tempCol%(K*K))/K;
-        int W_w = (tempCol%(K*K))%K;
-
-        if((tempCol < numMatAColumns) && (row < Map_out) )
-            wmma::load_matrix_sync(a_frag, mask_4d(W_m, W_c, W_h, W_w), lda);
-
-        int X_b = b;
-        int X_c = tempRow/(K*K);
-        int X_p = (tempRow%(K*K))/K;
-        int X_q = (tempRow%(K*K))%K;
-        int X_h = column / Width_out;
-        int X_w = column % Width_out;
-
-        if((tempRow < numMatAColumns) && (column < Height_out*Width_out) )
-            wmma::load_matrix_sync(b_frag, in_4d(X_b, X_c, X_p + X_h, X_q + X_w), ldb);
-
-        // Perform the matrix multiplication
-        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-    }
-
-    int Y_b = b;
-    int Y_m = row;
-    int Y_h = column / Width_out;
-    int Y_w = column % Width_out;
-
-    if ((row < Map_out) && (column < Height_out*Width_out)) {
-        wmma::load_matrix_sync(c_frag, out_4d(Y_b, Y_m, Y_h, Y_w), ldc, wmma::mem_row_major);
-
-        for(int i=0; i < c_frag.num_elements; i++) {
-            c_frag.x[i] = alpha * acc_frag.x[i] + beta * c_frag.x[i];
+    if (t < (C * W_unroll)) {
+        c = t / W_unroll;
+        s = t % W_unroll;
+        h_out = s / W_out;
+        w_out = s % W_out;
+        w_unroll = h_out * W_out + w_out;
+        w_base = c * K * K;
+        for(p = 0; p < K; p++){
+            for(q = 0; q < K; q++){
+                h_unroll = w_base + p * K + q;
+                X_unroll((h_unroll), (w_unroll)) = X((c), (h_out + p), (w_out + q)) ;
+            }
         }
-
-        // Store the output
-        wmma::store_matrix_sync(out_4d(Y_b, Y_m, Y_h, Y_w), c_frag, ldc, wmma::mem_row_major);
-   }
-
+    }
     #undef out_4d
     #undef in_4d
     #undef mask_4d
 }
-/*
- __global__ void half_to_float(__half *in_array, float *out,  int outlen, int M)
+
+__global__ void matrixMultiply(__half *mask, __half *B, float *C, int numARows,
+                               int numAColumns, int numBRows,
+                               int numBColumns, int numCRows,
+                               int numCColumns, int origm, int orign)
 {
-    const int map = threadIdx.y + blockDim.y*blockIdx.y;
-    const int z = blockIdx.z;
-    const int houtwout = threadIdx.x + blockDim.x*blockIdx.x;
-    if(map < M && houtwout < outlen) out[z*outlen*M + map*outlen+houtwout] = __half2float(in_array[z*outlen*M + map*outlen+houtwout]);
-}
 
-__global__ void conv_forward_kernel_32(__half *output, __half *input, __half *mask,
-     const int Batch, const int Map_out, const int Channel,
-     const int Height, const int Width, const int K)
-{
-    __shared__ __half tileA[TILE_WIDTH_32][TILE_WIDTH_32];
-    __shared__ __half tileB[TILE_WIDTH_32][TILE_WIDTH_32];
+    __shared__ __half subTileM[TILE_WIDTH_16][TILE_WIDTH_16];
+    __shared__ __half subTileN[TILE_WIDTH_16][TILE_WIDTH_16];
 
-    int b = blockIdx.z;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int row = blockIdx.y * TILE_WIDTH_32 + ty;
-    int column = blockIdx.x * TILE_WIDTH_32 + tx;
+    int bx = blockIdx.x; int by = blockIdx.y;
+    int tx = threadIdx.x; int ty = threadIdx.y;
 
-    int Height_out = Height - K + 1;
-    int Width_out = Width - K + 1;
+    // num of tiles in A and B both directions
+    int num_tiles = ceil((1.0*numBRows)/TILE_WIDTH_16);
 
-    int numMatAColumns = Channel*K*K;
-    __half acc=0.0;
+    // Identify the row and column of the P element to work on
+    int Row = by * TILE_WIDTH_16 + ty;
+    int Col = bx * TILE_WIDTH_16 + tx;
+    __half Pvalue = 0.0;
 
-    int numIterations = ceil((numMatAColumns*1.0)/TILE_WIDTH_32);
-
-    #define out_4d(i3, i2, i1, i0) output[(i3) * (Map_out * Height_out * Width_out) + (i2) * (Height_out * Width_out) + (i1) * (Width_out) + i0]
-    #define in_4d(i3, i2, i1, i0) input[(i3) * (Channel * Height * Width) + (i2) * (Height * Width) + (i1) * (Width) + i0]
-    #define mask_4d(i3, i2, i1, i0) mask[(i3) * (Channel * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-
-    for(int i=0; i<numIterations; i++){
-        int tempCol = i*TILE_WIDTH_32+tx;
-        int tempRow = i*TILE_WIDTH_32+ty;
-        tileA[ty][tx] = 0.0;
-        tileB[ty][tx] = 0.0;
-
-        int W_m = row;
-        int W_c = tempCol/(K*K);
-        int W_h = (tempCol%(K*K))/K;
-        int W_w = (tempCol%(K*K))%K;
-
-        if((tempCol < numMatAColumns) && (row < Map_out) )
-            tileA[ty][tx] = mask_4d(W_m, W_c, W_h, W_w);
-        else tileA[ty][tx] = 0.0;
-
-        int X_b = b;
-        int X_c = tempRow/(K*K);
-        int X_p = (tempRow%(K*K))/K;
-        int X_q = (tempRow%(K*K))%K;
-        int X_h = column / Width_out;
-        int X_w = column % Width_out;
-
-        if((tempRow < numMatAColumns) && (column < Height_out*Width_out) )
-            tileB[ty][tx] = in_4d(X_b, X_c, X_p + X_h, X_q + X_w);
-        else tileB[ty][tx] = 0.0;
+    Pvalue=0.0;
+    for (int q = 0; q < num_tiles; ++q) {
+        // Collaborative loading of M and N tiles into shared memory
+        int col = q* TILE_WIDTH_16 + tx;
+        int row = q * TILE_WIDTH_16 + ty;
+        if(Row < numCRows) {
+            if(col < numBRows ) subTileM[ty][tx] = mask[Row*numAColumns + col];
+            else subTileM[ty][tx] = 0.0;
+        }
+        else{
+            subTileM[ty][tx] = 0.0;
+        }
+        if(Col < numCColumns) {
+            if(row < numBRows ) subTileN[ty][tx] = B[row*numBColumns + Col];
+            else subTileN[ty][tx] = 0.0;
+        }
+        else{
+            subTileN[ty][tx] = 0.0;
+        }
 
         __syncthreads();
 
-        acc  += tileA[ty][0] * tileB[0][tx]
-        +tileA[ty][1] * tileB[1][tx]
-        +tileA[ty][2] * tileB[2][tx]
-        +tileA[ty][3] * tileB[3][tx]
-        +tileA[ty][4] * tileB[4][tx]
-        +tileA[ty][5] * tileB[5][tx]
-        +tileA[ty][6] * tileB[6][tx]
-        +tileA[ty][7] * tileB[7][tx]
-        +tileA[ty][8] * tileB[8][tx]
-        +tileA[ty][9] * tileB[9][tx]
-        +tileA[ty][10] * tileB[10][tx]
-        +tileA[ty][11] * tileB[11][tx]
-        +tileA[ty][12] * tileB[12][tx]
-        +tileA[ty][13] * tileB[13][tx]
-        +tileA[ty][14] * tileB[14][tx]
-        +tileA[ty][15] * tileB[15][tx]
-        +tileA[ty][16] * tileB[16][tx]
-        +tileA[ty][17] * tileB[17][tx]
-        +tileA[ty][18] * tileB[18][tx]
-        +tileA[ty][19] * tileB[19][tx]
-        +tileA[ty][20] * tileB[20][tx]
-        +tileA[ty][21] * tileB[21][tx]
-        +tileA[ty][22] * tileB[22][tx]
-        +tileA[ty][23] * tileB[23][tx]
-        +tileA[ty][24] * tileB[24][tx]
-        +tileA[ty][25] * tileB[25][tx]
-        +tileA[ty][26] * tileB[26][tx]
-        +tileA[ty][27] * tileB[27][tx]
-        +tileA[ty][28] * tileB[28][tx]
-        +tileA[ty][29] * tileB[29][tx]
-        +tileA[ty][30] * tileB[30][tx]
-        +tileA[ty][31] * tileB[31][tx];
+        for (int k = 0; k < 16; ++k)
+                Pvalue += subTileM[ty][k] * subTileN[k][tx];
 
-        __syncthreads ();
+        __syncthreads();
     }
-
-    int Y_b = b;
-    int Y_m = row;
-    int Y_h = column / Width_out;
-    int Y_w = column % Width_out;
-    if((row < Map_out) && (column < Height_out*Width_out))
-            out_4d(Y_b, Y_m, Y_h, Y_w) = acc;
-
-    #undef out_4d
-    #undef in_4d
-    #undef mask_4d
+     if(Row < origm && Col < orign) C[Row*orign+Col] = __half2float(Pvalue);
 }
- */
 
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, const float *host_input, const float *host_mask, float **device_output_ptr, float **device_input_ptr, float **device_mask_ptr, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
-    // Allocate memory and copy over the relevant data structures to the GPU
-
-    // We pass double pointers for you to initialize the relevant device pointers,
-    //  which are passed to the other two functions.
-
-    const int Height_out = Height - K + 1;
-    const int Width_out = Width - K + 1;
+    int W = Width;
+    int H = Height;
+    int C= Channel;
+    int W_out = W - K + 1;
+    int H_out = H - K + 1;
+    int H_unroll = C * K * K;
+    int W_unroll = H_out * W_out;
 
     int inputSize = Batch * Channel * Height * Width;
     int maskSize = Map_out * Channel * K * K;
-    int outputSize = Batch * Map_out * Height_out * Width_out;
+    int outputSize = Batch * Map_out * H_out * W_out;
 
-    std::cout<<"Height_out "<< Height_out <<std::endl;
-    std::cout<<"Width_out "<< Width_out <<std::endl;
-    std::cout<<"Channel "<< Channel <<std::endl;
-    std::cout<<"K "<< K <<std::endl;
-    std::cout<<"Map_out "<< Map_out <<std::endl;
+     std::cout<<"Height_out: "<< H_out <<std::endl;
+    std::cout<<"Width_out: "<< W_out <<std::endl;
+    std::cout<<"Channel: "<< Channel <<std::endl;
+    std::cout<<"K: "<< K <<std::endl;
+    std::cout<<"Map_out: "<< Map_out <<std::endl;
 
-     __half *h_host_input, *h_host_mask, *half_device_input_ptr, *half_device_mask;
+    __half *device_X_unrolled, *device_X;
+    __half *device_mask_padded, *device_X_unrolled_padded;
+    float *device_output;
+    errCheck(cudaMalloc((void **) &device_X_unrolled, W_unroll * H_unroll * sizeof(__half)));
+    errCheck(cudaMalloc((void **) &device_X, inputSize * sizeof(__half)));
+    errCheck(cudaMalloc((void **) &device_output, (outputSize/Batch) * sizeof(float)));
 
-     h_host_input = (__half*) malloc(inputSize*sizeof(__half));
-     h_host_mask = (__half*) malloc(maskSize*sizeof(__half));
-     for (int i=0; i<inputSize; i++)
-        h_host_input[i] = __float2half(host_input[i]);
 
-     for (int i=0; i<maskSize; i++)
+    __half *h_host_input, *h_host_mask, *h_host_paddedX, *h_host_paddedmask;
+    // transform inputs to half.
+    h_host_mask = (__half*) malloc(maskSize*sizeof(__half));
+    for (int i=0; i<maskSize; i++){
         h_host_mask[i] = __float2half(host_mask[i]);
+    }
+    h_host_input = (__half*) malloc(inputSize*sizeof(__half));
+    for (int i=0; i<inputSize; i++){
+        h_host_input[i] = __float2half(host_input[i]);
+    }
+    // load half arrays to unroll
+    errCheck(cudaMemcpy(device_X, h_host_input, inputSize * sizeof(__half), cudaMemcpyHostToDevice));
 
-    errCheck(cudaMalloc((void **) &half_device_input_ptr, MATRIX_K1 * sizeof(__half)));
-     errCheck(cudaMalloc((void **) &half_device_mask, maskSize * sizeof(__half)));
-    errCheck(cudaMalloc((void **) device_output_ptr, outputSize * sizeof(float)));
+    __half *h_host_tempunrolled;
+    int padded_m = Map_out + (ceil(Map_out/16.0) - Map_out/16.0)*16.0;
+    int padded_k = H_unroll + (ceil(H_unroll/16.0) - H_unroll/16.0)*16.0;
+    int padded_n = W_unroll + (ceil(W_unroll/16.0) - W_unroll/16.0)*16.0;
+    h_host_paddedmask = (__half*) malloc(padded_k * padded_m * sizeof(__half));
+    h_host_paddedX = (__half*) malloc(padded_k * padded_n * sizeof(__half));
+    h_host_tempunrolled = (__half*) malloc(W_unroll * H_unroll * sizeof(__half));
+    errCheck(cudaMalloc((void **) &device_X_unrolled_padded, padded_k * padded_n * sizeof(__half)));
+    errCheck(cudaMalloc((void **) &device_mask_padded, padded_k * padded_m * sizeof(__half)));
 
-    errCheck(cudaMemcpy(half_device_input_ptr, h_host_input, inputSize * sizeof(__half), cudaMemcpyHostToDevice));
-    errCheck(cudaMemcpy(half_device_mask, h_host_mask, maskSize * sizeof(__half), cudaMemcpyHostToDevice));
+    int num_threads = C * H_out * W_out;
+    int num_blocks = ceil((1.0 * num_threads) / MAX_NUM_THREADS);
 
-    cudaErrCheck(cudaMalloc((void**)&a_fp16, MATRIX_M * MATRIX_K * sizeof(half)));
-   cudaErrCheck(cudaMalloc((void**)&b_fp16, MATRIX_K * MATRIX_N * sizeof(half)));
+    dim3 gridDim (ceil(1.0 * padded_n / TILE_WIDTH_16),  ceil(1.0 *  padded_m/ TILE_WIDTH_16), 1);
+    dim3 blockDim (TILE_WIDTH_16, TILE_WIDTH_16, 1);
 
-   cudaErrCheck(cudaMalloc((void**)&c, MATRIX_M * MATRIX_N * sizeof(float)));
+    for (int n=0; n < Batch; n++) {
+        // unroll kernel
+        conv_forward_kernel<<<num_blocks, MAX_NUM_THREADS>>>(device_X_unrolled, device_X + n*(inputSize/Batch), NULL,Batch,Map_out,C,  H,  W,  K);
+        errCheck(cudaMemcpy(h_host_tempunrolled, device_X_unrolled, (W_unroll * H_unroll) * sizeof(__half), cudaMemcpyDeviceToHost));
 
+        for(int i=0; i<padded_k; i++){
+            for(int j=0; j<padded_n; j++){
+                if(i<H_unroll && j<W_unroll) h_host_paddedX[i*padded_n +j] = h_host_tempunrolled[i*W_unroll +j];
+                else h_host_paddedX[i*padded_n +j] = __float2half(0.0);
+            }
+        }
+        for(int i=0; i<padded_m; i++){
+            for(int j=0; j<padded_k; j++){
+                if(i<Map_out && j<H_unroll) h_host_paddedmask[i*padded_k +j] = h_host_mask[i*H_unroll +j];
+                else h_host_paddedmask[i*padded_k +j] = __float2half(0.0);
+            }
+        }
 
-    // First: using WMMA
-   dim3 gridDim;
-   dim3 blockDim;
+        //std::cout << "padded arr for unrolled inside: " << __half2float(h_host_paddedX[(H_unroll-3)*padded_n+(W_unroll-1)]) << std::endl;
+        //std::cout << "padded arr for unrolled outside: " << __half2float(h_host_paddedX[(H_unroll+3)*padded_n+(W_unroll-1)]) << std::endl;
+        errCheck(cudaMemcpy(device_X_unrolled_padded, h_host_paddedX, padded_k * padded_n * sizeof(__half), cudaMemcpyHostToDevice));
+        errCheck(cudaMemcpy(device_mask_padded, h_host_paddedmask, padded_k * padded_m * sizeof(__half), cudaMemcpyHostToDevice));
 
-   // blockDim.x must be a multple of warpSize
-   // 128x4 means we have 16 warps and a block computes a 64x64 output tile
-   blockDim.x = 128;
-   blockDim.y = 4;
+        matrixMultiply<<<gridDim, blockDim>>>(device_mask_padded, device_X_unrolled_padded, device_output, padded_m,
+                               padded_k, padded_k,
+                               padded_n,
+                               padded_m,padded_n,
+                               Map_out, W_unroll ) ;
 
-   gridDim.x = (MATRIX_M + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
-   gridDim.y = (MATRIX_N + WMMA_N * blockDim.y - 1) / (WMMA_N * blockDim.y);
-
-   cudaEvent_t startWMMA;
-   cudaEvent_t stopWMMA;
-   errCheck(cudaEventCreate(&startWMMA));
-   errCheck(cudaEventCreate(&stopWMMA));
-
-   printf("Running with wmma...\n");
-   errCheck(cudaEventRecord(startWMMA));
-   conv_forward_kernel_16 <<< gridDim, blockDim >>> (*device_output_ptr, h_host_input, h_host_mask, Batch, Map_out, Channel, Height,Width, K);
-   errCheck(cudaEventRecord(stopWMMA));
-
-   errCheck(cudaEventDestroy(startWMMA));
-   errCheck(cudaEventDestroy(stopWMMA));
-
-
-    //dim3 blockDim(TILE_WIDTH_16, TILE_WIDTH_16 , 1);
-    //dim3 gridDim(ceil((1.0* Width_out* Height_out)/TILE_WIDTH_16), ceil((1.0*Map_out)/TILE_WIDTH_16), Batch);
-    //conv_forward_kernel_16<<< gridDim, blockDim >>>(half_device_output_ptr, half_device_input_ptr, half_device_mask, Batch, Map_out, Channel, Height,Width, K );
-    /*if(Map_out / 16 ){}
-    else{
-        dim3 blockDim(TILE_WIDTH_32, TILE_WIDTH_32 , 1);
-        dim3 gridDim(ceil((1.0* Width_out* Height_out)/TILE_WIDTH_32), ceil((1.0*Map_out)/TILE_WIDTH_32), Batch);
-        conv_forward_kernel_32<<< gridDim, blockDim >>>(half_device_output_ptr, half_device_input_ptr, half_device_mask, Batch, Map_out, Channel, Height,Width, K );
+        errCheck(cudaMemcpy((void *) (host_output + n*(outputSize/Batch)), device_output, (outputSize/Batch) * sizeof(float), cudaMemcpyDeviceToHost));
     }
 
+    // Free device memory
+    errCheck(cudaFree(device_output));
+    errCheck(cudaFree(device_X_unrolled));
+    errCheck(cudaFree(device_X));
 
-    cudaDeviceSynchronize();
+    errCheck(cudaFree(device_mask_padded));
+    errCheck(cudaFree(device_X_unrolled_padded));
 
-    dim3 b(TILE_WIDTH_32, TILE_WIDTH_32 , 1);
-    dim3 g(ceil((1.0* Width_out* Height_out)/TILE_WIDTH_32), ceil((1.0*Map_out)/TILE_WIDTH_32), Batch);
-    half_to_float<<<g, b>>>(half_device_output_ptr, *device_output_ptr, Height_out*Width_out, Map_out );
-    errCheck(cudaMemcpy((void*) host_output, *device_output_ptr, outputSize * sizeof(float), cudaMemcpyDeviceToHost));
-     */
-
-
-    //errCheck(cudaFree(half_device_output_ptr));
-    //errCheck(cudaFree(half_device_input_ptr));
-    //errCheck(cudaFree(device_output_ptr));
-    //errCheck(cudaFree(half_device_mask));
 
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();
@@ -332,7 +216,6 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
 {
     // Set the kernel dimensions and call the kernel
 
-
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();
     if(error != cudaSuccess)
@@ -345,17 +228,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *device_output, float *device_input, float *device_mask, const int Batch, const int Map_out, const int Channel, const int Height, const int Width, const int K)
 {
-    /*
-    std::cout<<" Height_out: "<< Height_out <<std::endl;
-    std::cout<<" Width_out: "<< Width_out <<std::endl;
-    std::cout<<" Height: "<< Height <<std::endl;
-    std::cout<<" Width: "<< Width <<std::endl;
-     */
-
-    // Free device memory
-    //errCheck(cudaFree(device_output));
-    //errCheck(cudaFree(device_input));
-    //errCheck(cudaFree(device_mask));
+    // Copy the output back to host'
 
     // Useful snippet for error checking
     cudaError_t error = cudaGetLastError();

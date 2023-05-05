@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <cuda_fp16.h>
 #include "gpu-new-forward.h"
+#include <mma.h>
+using namespace nvcuda;
 
 #define errCheck(ans) { checkError((ans), __FILE__, __LINE__); }
 inline void checkError(cudaError_t err, const char * file, int line, bool abort = true) {
@@ -12,7 +14,18 @@ inline void checkError(cudaError_t err, const char * file, int line, bool abort 
 }
 
 //__constant__ float mask[3136];
-#define TILE_WIDTH 20
+#define TILE_WIDTH_16 16
+//#define TILE_WIDTH_32 32
+// do padding for the dimensions
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+#define MATRIX_M1 16 // 4 = MATRIX_M2
+#define MATRIX_N1 640 // = orig, 80*80=640
+#define MATRIX_K1 64 // 1*7*7 = 49
+#define MATRIX_M2 16
+#define MATRIX_N2 912 // 30*30 ?? CONFIRM
+#define MATRIX_K2 208 // 4*7*7 = 196
 
 __global__ void half_to_float(__half *in_array, float *out, const int Batch, const int Map_out, const int Channel,
      const int Height, const int Width, const int K)
@@ -153,15 +166,37 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, co
     int maskSize = Map_out * Channel * K * K;
      int outputSize = Batch * Map_out * Height_out * Width_out;
 
+     std::cout<<"Height_out "<< Height_out <<std::endl;
+    std::cout<<"Width_out "<< Width_out <<std::endl;
+    std::cout<<"Channel "<< Channel <<std::endl;
+    std::cout<<"K "<< K <<std::endl;
+    std::cout<<"Map_out "<< Map_out <<std::endl;
+
     __half *h_host_input, *h_host_mask, *half_device_input_ptr, *half_device_output_ptr, *half_device_mask;
 
-    h_host_input = (__half*) malloc(inputSize*sizeof(__half));
-    for (int i=0; i<inputSize; i++)
-        h_host_input[i] = __float2half(host_input[i]);
+    h_host_mask = (__half*) malloc(MATRIX_M1*MATRIX_K1*sizeof(__half));
+    if(Channel * K * K== 640){
+        for (int i=0; i<MATRIX_M1; i++){
+            for (int j=0; j<MATRIX_K1; j++)
+                if(i<Map_out &&) h_host_mask[i] = __float2half(host_mask[i]);
+                else h_host_mask[i] = __float2half(0.0);
+        }
+        h_host_input = (__half*) malloc(MATRIX_K1*MATRIX_N1*sizeof(__half));
+        for (int i=0; i<MATRIX_K1*MATRIX_N1; i++)
+            if(i<Map_out) h_host_input[i] = __float2half(host_input[i]);
+            else h_host_input[i] = __float2half(0.0);
+        }
+    else{
+        for (int i=0; i<MATRIX_M1*MATRIX_K1; i++)
+            if(i<Map_out) h_host_mask[i] = __float2half(host_mask[i]);
+            else h_host_mask[i] = __float2half(0.0);
 
-    h_host_mask = (__half*) malloc(maskSize*sizeof(__half));
-    for (int i=0; i<maskSize; i++)
-        h_host_mask[i] = __float2half(host_mask[i]);
+        h_host_input = (__half*) malloc(MATRIX_K1*MATRIX_N1*sizeof(__half));
+        for (int i=0; i<MATRIX_K1*MATRIX_N1; i++)
+            if(i<Map_out) h_host_input[i] = __float2half(host_input[i]);
+            else h_host_input[i] = __float2half(0.0);
+    }
+    }
 
     errCheck(cudaMalloc((void **) &half_device_input_ptr, inputSize * sizeof(__half)));
     errCheck(cudaMalloc((void **) &half_device_mask, maskSize * sizeof(__half)));
